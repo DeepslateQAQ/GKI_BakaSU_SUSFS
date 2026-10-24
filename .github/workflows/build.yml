@@ -328,6 +328,13 @@ jobs:
             echo "克隆 SUSFS (分支: $SUSFS_BRANCH)..."
             # BakaSU 使用 simonpunk 的原版 SUSFS
             git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+            # BakaSU-SUSFS-COMPAT: candidate versions, not boot-tested.
+            if [[ "${{ inputs.ksu_variant }}" == "BakaSU" \
+                  && "${{ inputs.enable_susfs }}" == "true" \
+                  && "$SUSFS_BRANCH" == "gki-android14-6.1" ]]; then
+              SUSFS_COMPAT_REF="2385dab487c3abb8c4a2990ea5c852f55fb47dc8"
+              git -C susfs4ksu checkout --detach "$SUSFS_COMPAT_REF"
+            fi
 
             # 检查是否启用自定义提交
             CONFIG_FILE="config/config"
@@ -575,7 +582,14 @@ jobs:
             echo "使用自定义分支/提交: $branch_input"
           else
             # BakaSU 默认使用 main 分支
-            BRANCH="main"
+            if [[ "${{ inputs.ksu_variant }}" == "BakaSU" \
+                  && "${{ inputs.enable_susfs }}" == "true" \
+                  && "${{ inputs.android_version }}-${{ inputs.kernel_version }}" == "android14-6.1" ]]; then
+              # BakaSU-SUSFS-COMPAT: PR #624 candidate, not main.
+              BRANCH="10cada7"
+            else
+              BRANCH="main"
+            fi
           fi
 
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
@@ -596,6 +610,19 @@ jobs:
             if [[ "$BRANCH" =~ ^[a-fA-F0-9]{40}$ ]] && [[ "${KSU_ACTUAL_REF,,}" != "${BRANCH,,}" ]]; then
               echo "::error::BakaSU 实际提交 $KSU_ACTUAL_REF 与指定提交 $BRANCH 不一致"
               exit 1
+            fi
+            # BakaSU-SUSFS-COMPAT: verify selected commit.
+            if [[ "${{ inputs.ksu_variant }}" == "BakaSU" \
+                  && "${{ inputs.enable_susfs }}" == "true" \
+                  && "${{ inputs.android_version }}-${{ inputs.kernel_version }}" == "android14-6.1" ]]; then
+              if [[ "$BRANCH" == "10cada7" && "${KSU_ACTUAL_REF:0:7}" != "10cada7" ]]; then
+                echo "::error::Unexpected BakaSU checkout $KSU_ACTUAL_REF"
+                exit 1
+              fi
+              if grep -qF '$(error Please wait susfs update.)' KernelSU/kernel/tools/susfs_compat.mk; then
+                echo "::error::BakaSU still deliberately blocks SUSFS"
+                exit 1
+              fi
             fi
             echo "KSU_ACTUAL_REF=$KSU_ACTUAL_REF" >> "$GITHUB_ENV"
             KSU_LATEST_COMMIT_DATE=$(git -C KernelSU log -1 --date=format:'%Y-%m-%d %H:%M:%S %z' --format='%cd')
@@ -689,10 +716,6 @@ jobs:
               echo "临时调整 Android 14 6.1 dma-buf.h 上下文"
               sed -i '/^#include <linux\/cpufreq_times.h>$/a #include <linux/dma-buf.h>' fs/proc/base.c
             fi
-            if [[ "$CURRENT_SUB" -ge 157 ]]; then
-              echo "临时调整 Android 14 6.1 namespace.c 上下文"
-              sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
-            fi
           fi
 
           if [[ "${{ inputs.android_version }}" == "android15" && "${{ inputs.kernel_version }}" == "6.6" ]]; then
@@ -717,7 +740,8 @@ jobs:
             fi
           fi
 
-          patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch || true
+          SUSFS_PATCH_STATUS=0
+          patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch || SUSFS_PATCH_STATUS=$?
 
           # 主补丁应用后还原临时上下文，避免无关源码差异保留到最终产物
           if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
@@ -762,10 +786,6 @@ jobs:
             if [[ "$CURRENT_SUB" -le 141 ]]; then
               echo "还原 Android 14 6.1 base.c 临时调整"
               sed -i '/^#include <linux\/dma-buf.h>$/d' fs/proc/base.c
-            fi
-            if [[ "$CURRENT_SUB" -ge 157 ]] && ! grep -qF '#include <trace/hooks/blk.h>' fs/namespace.c; then
-              echo "还原 Android 14 6.1 namespace.c 临时调整"
-              sed -i '/^#include "internal.h"$/a #include <trace/hooks/blk.h>' fs/namespace.c
             fi
           fi
 
@@ -902,6 +922,19 @@ jobs:
             fi
           fi
 
+          # BakaSU-SUSFS-COMPAT: reject incomplete SUSFS patch.
+          if [[ "${{ inputs.ksu_variant }}" == "BakaSU" \
+                && "${{ inputs.android_version }}-${{ inputs.kernel_version }}" == "android14-6.1" ]]; then
+            if [[ "$SUSFS_PATCH_STATUS" -ne 0 ]] || find . -type f -name '*.rej' -print -quit | grep -q .; then
+              echo "::error::SUSFS patch did not apply completely"
+              find . -type f -name '*.rej' -print
+              exit 1
+            fi
+            if ! grep -qF '#include <linux/susfs_def.h>' fs/namespace.c; then
+              echo "::error::Missing SUSFS header in fs/namespace.c"
+              exit 1
+            fi
+          fi
       - name: 克隆 Droidspaces 补丁仓库
         if: inputs.clean_build != true && inputs.droidspaces != 'off'
         run: |
